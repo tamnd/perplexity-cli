@@ -2,34 +2,21 @@ package perplexity
 
 import (
 	"context"
-	"net/url"
+	"fmt"
+	"os"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes perplexity as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/perplexity-cli/perplexity"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// perplexity:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone pplx binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the perplexity driver. It carries no state; the per-run client is
+// Domain is the Perplexity driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme and the identity the standalone binary inherits.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "perplexity",
@@ -37,44 +24,49 @@ func (Domain) Info() kit.DomainInfo {
 		Identity: kit.Identity{
 			Binary: "pplx",
 			Short:  "Query Perplexity AI from the command line.",
-			Long: `Query Perplexity AI from the command line.
+			Long: `pplx runs an AI-powered web search via the Perplexity API and prints
+the answer with cited sources.
 
-pplx reads public perplexity data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+Requires a Perplexity API key in PPLX_API_KEY.
+Get one at: https://perplexity.ai/api
+
+Quick start:
+  pplx search "how does TCP congestion control work"
+  pplx search "latest Go release" --model sonar-pro --recency week
+  pplx search "rust vs go" -o raw
+  pplx models`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/perplexity-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `pplx page` and
-	// `ant get perplexity://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "query",
+		Summary: "Run an AI-powered web search",
+		Args:    []kit.Arg{{Name: "query", Help: "search query"}},
+	}, searchOp)
 
-	// List op: members of a page, the home of `pplx links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// perplexity://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "models",
+		Group:   "info",
+		Summary: "List available Perplexity models",
+	}, modelsOp)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds a Client from the kit Config, reading PPLX_API_KEY from env.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
-	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+	key := os.Getenv("PPLX_API_KEY")
+	if key == "" {
+		return nil, fmt.Errorf("PPLX_API_KEY is not set; get a key at https://perplexity.ai/api")
 	}
+	c := DefaultConfig()
+	c.APIKey = key
 	if cfg.Rate > 0 {
 		c.Rate = cfg.Rate
 	}
@@ -82,92 +74,75 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	if cfg.UserAgent != "" {
+		c.UserAgent = cfg.UserAgent
+	}
+	return NewClient(c), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type searchInput struct {
+	Query    string   `kit:"arg"                    help:"search query"`
+	Model    string   `kit:"flag"                   help:"model name (sonar, sonar-pro, sonar-reasoning, sonar-reasoning-pro, sonar-deep-research)" default:"sonar"`
+	System   string   `kit:"flag"                   help:"system prompt" default:"Be precise and concise."`
+	MaxTok   int      `kit:"flag,name=max-tokens"   help:"max output tokens" default:"1024"`
+	Recency  string   `kit:"flag"                   help:"recency filter: hour, day, week, month, all" default:"month"`
+	Domains  []string `kit:"flag,name=domain"       help:"restrict search to domain (repeatable)"`
+	NoSystem bool     `kit:"flag,name=no-system"    help:"send no system prompt"`
+	Client   *Client  `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
-}
+type modelsInput struct{}
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchOp(ctx context.Context, in searchInput, emit func(*SearchResult) error) error {
+	if in.Query == "" {
+		return errs.Usage("pplx search: query is required")
+	}
+	sys := in.System
+	if in.NoSystem {
+		sys = ""
+	}
+	if in.Model != "" && !ValidModel(in.Model) {
+		// warn but proceed -- Perplexity may add new models
+		_, _ = fmt.Fprintf(os.Stderr, "warning: unknown model %q; proceeding anyway\n", in.Model)
+	}
+
+	opts := SearchOptions{
+		Model:     in.Model,
+		System:    sys,
+		MaxTokens: in.MaxTok,
+		Recency:   in.Recency,
+		Domains:   in.Domains,
+	}
+	result, err := in.Client.Search(ctx, in.Query, opts)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
+	return emit(result)
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+func modelsOp(_ context.Context, _ modelsInput, emit func(*Model) error) error {
+	for i := range KnownModels {
+		if err := emit(&KnownModels[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full perplexity.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized perplexity reference: %q", input)
-	}
-	return "page", id, nil
-}
-
-// Locate is the inverse: the live https URL for a (type, id).
-func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("perplexity has no resource type %q", uriType)
-	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts library errors to kit error kinds with the right exit code.
 func mapErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "http 401") || strings.Contains(msg, "http 403") {
+		return errs.RateLimited("%s", msg)
+	}
 	return err
 }

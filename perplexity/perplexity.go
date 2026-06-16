@@ -1,62 +1,198 @@
 // Package perplexity is the library behind the pplx command line:
-// the HTTP client, request shaping, and the typed data models for perplexity.
+// the HTTP client and typed data models for the Perplexity AI API.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// Perplexity exposes an OpenAI-compatible chat completions endpoint at
+// api.perplexity.ai. A bearer key (PPLX_API_KEY) is required. This package
+// wraps the endpoint with a paced, retrying POST client and maps the response
+// into a SearchResult record with the answer text and cited sources.
 package perplexity
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to perplexity. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
+// DefaultUserAgent identifies the client to Perplexity.
 const DefaultUserAgent = "pplx/dev (+https://github.com/tamnd/perplexity-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at perplexity.com; change it once you
-// know the real endpoints you want to read.
-const Host = "perplexity.com"
+// Host is the site this client talks to.
+const Host = "perplexity.ai"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// APIBase is the root of the Perplexity API.
+const APIBase = "https://api.perplexity.ai"
 
-// Client talks to perplexity over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// DefaultModel is the model used when no --model flag is given.
+const DefaultModel = "sonar"
+
+// Config holds constructor parameters for Client.
+type Config struct {
+	APIBase   string
+	APIKey    string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible defaults for the Perplexity API.
+func DefaultConfig() Config {
+	return Config{
+		APIBase:   APIBase,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      500 * time.Millisecond,
+		Retries:   3,
+		Timeout:   60 * time.Second,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the Perplexity API over HTTPS. It paces requests, retries
+// transient failures, and injects the bearer token on every request.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client configured with cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// SearchRequest is the body sent to POST /chat/completions.
+type SearchRequest struct {
+	Model                  string   `json:"model"`
+	Messages               []Msg    `json:"messages"`
+	MaxTokens              int      `json:"max_tokens,omitempty"`
+	Temperature            float64  `json:"temperature"`
+	TopP                   float64  `json:"top_p"`
+	SearchDomainFilter     []string `json:"search_domain_filter,omitempty"`
+	ReturnImages           bool     `json:"return_images"`
+	ReturnRelatedQuestions bool     `json:"return_related_questions"`
+	SearchRecencyFilter    string   `json:"search_recency_filter,omitempty"`
+	Stream                 bool     `json:"stream"`
+	PresencePenalty        float64  `json:"presence_penalty"`
+	FrequencyPenalty       float64  `json:"frequency_penalty"`
+}
+
+// Msg is one message in the conversation.
+type Msg struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// apiResponse is the raw response from the Perplexity API.
+type apiResponse struct {
+	ID        string      `json:"id"`
+	Model     string      `json:"model"`
+	Created   int64       `json:"created"`
+	Usage     apiUsage    `json:"usage"`
+	Citations []string    `json:"citations"`
+	Choices   []apiChoice `json:"choices"`
+}
+
+type apiUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+type apiChoice struct {
+	Index        int    `json:"index"`
+	FinishReason string `json:"finish_reason"`
+	Message      Msg    `json:"message"`
+}
+
+// Search sends a single-turn AI search query and returns the result.
+func (c *Client) Search(ctx context.Context, query string, opts SearchOptions) (*SearchResult, error) {
+	msgs := []Msg{}
+	if opts.System != "" {
+		msgs = append(msgs, Msg{Role: "system", Content: opts.System})
+	}
+	msgs = append(msgs, Msg{Role: "user", Content: query})
+
+	model := opts.Model
+	if model == "" {
+		model = DefaultModel
+	}
+
+	maxTok := opts.MaxTokens
+	if maxTok == 0 {
+		maxTok = 1024
+	}
+
+	recency := opts.Recency
+	if recency == "all" {
+		recency = ""
+	}
+
+	req := SearchRequest{
+		Model:                  model,
+		Messages:               msgs,
+		MaxTokens:              maxTok,
+		Temperature:            0.2,
+		TopP:                   0.9,
+		SearchDomainFilter:     opts.Domains,
+		ReturnImages:           false,
+		ReturnRelatedQuestions: false,
+		SearchRecencyFilter:    recency,
+		Stream:                 false,
+		PresencePenalty:        0,
+		FrequencyPenalty:       1,
+	}
+
+	body, err := c.post(ctx, "/chat/completions", req)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp apiResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	if len(resp.Choices) == 0 {
+		return nil, fmt.Errorf("perplexity: empty choices in response")
+	}
+
+	citations := make([]Citation, len(resp.Citations))
+	for i, u := range resp.Citations {
+		citations[i] = Citation{Index: i + 1, URL: u}
+	}
+
+	return &SearchResult{
+		ID:    resp.ID,
+		Model: resp.Model,
+		Query: query,
+		Answer: resp.Choices[0].Message.Content,
+		Citations: citations,
+		Tokens: Usage{
+			Prompt:     resp.Usage.PromptTokens,
+			Completion: resp.Usage.CompletionTokens,
+			Total:      resp.Usage.TotalTokens,
+		},
+		CreatedAt: resp.Created,
+	}, nil
+}
+
+// post sends a POST request with a JSON body and returns the response body.
+func (c *Client) post(ctx context.Context, path string, body any) ([]byte, error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
+
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,137 +200,85 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		data, retry, err := c.doPost(ctx, path, b)
 		if err == nil {
-			return body, nil
+			return data, nil
 		}
 		lastErr = err
 		if !retry {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("post %s: %w", path, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) doPost(ctx context.Context, path string, body []byte) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.APIBase+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
-	}
-
-	b, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, true, err
 	}
-	return b, false, nil
+
+	switch {
+	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return nil, false, fmt.Errorf("http %d: check your PPLX_API_KEY", resp.StatusCode)
+	case resp.StatusCode != http.StatusOK:
+		msg := apiErrMsg(data)
+		if msg != "" {
+			return nil, false, fmt.Errorf("http %d: %s", resp.StatusCode, msg)
+		}
+		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
+	}
+	return data, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
+// apiErrMsg tries to extract a human-readable error message from an API error body.
+func apiErrMsg(data []byte) string {
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(data, &e) == nil && e.Error.Message != "" {
+		return e.Error.Message
+	}
+	return ""
+}
+
+// pace blocks until at least Rate has passed since the last request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
 }
 
 func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
+	d := time.Duration(attempt) * time.Second
 	if d > 5*time.Second {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on perplexity.com. It is a stand-in for the typed records you
-// will model from the real perplexity endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `pplx cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }

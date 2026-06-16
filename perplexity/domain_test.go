@@ -2,13 +2,11 @@ package perplexity
 
 import (
 	"testing"
-
-	"github.com/tamnd/any-cli/kit"
 )
 
-// These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in perplexity_test.go.
+// domain_test.go tests the pure, network-free parts of the domain: Info fields
+// and the static model list. The HTTP behaviour is covered in perplexity_test.go
+// (external test package, uses httptest).
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
@@ -23,54 +21,34 @@ func TestDomainInfo(t *testing.T) {
 	}
 }
 
-func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+func TestKnownModels(t *testing.T) {
+	if len(KnownModels) == 0 {
+		t.Fatal("KnownModels is empty")
 	}
-	for _, tc := range cases {
-		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
+	for _, m := range KnownModels {
+		if m.Name == "" {
+			t.Error("model has empty Name")
+		}
+		if m.Description == "" {
+			t.Error("model has empty Description")
+		}
+		if m.Context == 0 {
+			t.Errorf("model %q has zero Context", m.Name)
 		}
 	}
 }
 
-func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
-	if err != nil || got != want {
-		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
+func TestValidModel(t *testing.T) {
+	if !ValidModel("sonar") {
+		t.Error("ValidModel(sonar) should be true")
 	}
-}
-
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
-func TestHostWiring(t *testing.T) {
-	h, err := kit.Open()
-	if err != nil {
-		t.Fatal(err)
+	if !ValidModel("sonar-pro") {
+		t.Error("ValidModel(sonar-pro) should be true")
 	}
-
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
-	if err != nil {
-		t.Fatalf("Mint: %v", err)
+	if ValidModel("gpt-4") {
+		t.Error("ValidModel(gpt-4) should be false")
 	}
-	if want := "perplexity://page/wiki/Go"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
-	}
-
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("perplexity", "about")
-	if err != nil || got.String() != "perplexity://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want perplexity://page/about", got.String(), err)
+	if ValidModel("") {
+		t.Error("ValidModel('') should be false")
 	}
 }
